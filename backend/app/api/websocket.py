@@ -1,157 +1,141 @@
-
 import asyncio
+import io
 import json
-import os
-import tempfile
-
+import wave
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-
+from sqlalchemy.orm import Session
+from app.database import SessionLocal
+from app.models import Transcription
 from app.transcription import transcribe_audio
 
 router = APIRouter()
+SAMPLE_RATE = 16000
+WINDOW_SECONDS = 8
+UPDATE_EVERY_SECONDS = 4
+MAX_AUDIO_SECONDS = 60 * 30
 
-MAX_AUDIO_SIZE = 100 * 1024 * 1024  # 100 MB
+def pcm_to_wav(pcm: bytes) -> str:
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        path = f.name
+    with wave.open(path, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(SAMPLE_RATE)
+        wav.writeframes(pcm)
+    return path
 
+def merge_text(previous: str, current: str) -> str:
+    """Replace the prior rolling-window hypothesis without duplicating overlap."""
+    a = previous.split()
+    b = current.split()
+    max_overlap = min(len(a), len(b), 30)
+    overlap = 0
+    for n in range(1, max_overlap + 1):
+        if [x.lower() for x in a[-n:]] == [x.lower() for x in b[:n]]:
+            overlap = n
+    if overlap:
+        return " ".join(a + b[overlap:]).strip()
+    # The rolling window may revise words; prefer the latest hypothesis.
+    return current.strip() if current else previous
 
 @router.websocket("/ws/transcribe")
-async def transcribe_websocket(websocket: WebSocket):
-    await websocket.accept()
-
-    print("WebSocket client connected")
-
-    audio_buffer = bytearray()
+async def transcribe_websocket(ws: WebSocket):
+    await ws.accept()
+    pcm_buffer = bytearray()
     selected_language = "auto"
-
+    transcript = ""
+    last_processed_samples = 0
+    title = "Live transcription"
     try:
-        await websocket.send_json({
-            "type": "connected",
-            "message": "WebSocket connection established"
-        })
-
+        await ws.send_json({"type": "connected", "message": "PCM streaming connection ready"})
         while True:
-            message = await websocket.receive()
-
-            # Handle binary audio chunks.
+            message = await ws.receive()
             if message.get("bytes") is not None:
-                audio_chunk = message["bytes"]
-
-                audio_buffer.extend(audio_chunk)
-
-                if len(audio_buffer) > MAX_AUDIO_SIZE:
-                    await websocket.send_json({
-                        "type": "transcription_error",
-                        "message": "Audio size exceeded the 100 MB limit."
-                    })
-                    await websocket.close()
+                chunk = message["bytes"]
+                pcm_buffer.extend(chunk)
+                total_samples = len(pcm_buffer) // 2
+                if total_samples > SAMPLE_RATE * MAX_AUDIO_SECONDS:
+                    await ws.send_json({"type": "transcription_error", "message": "Recording exceeded 30 minutes."})
+                    await ws.close()
                     return
+                await ws.send_json({"type": "audio_received", "total_bytes": len(pcm_buffer)})
+                elapsed = total_samples / SAMPLE_RATE
+                if elapsed >= WINDOW_SECONDS and elapsed - (last_processed_samples / SAMPLE_RATE) >= UPDATE_EVERY_SECONDS:
+                    start_sample = max(0, total_samples - SAMPLE_RATE * WINDOW_SECONDS)
+                    start_byte = start_sample * 2
+                    wav_path = pcm_to_wav(bytes(pcm_buffer[start_byte:]))
+                    try:
+                        result = await asyncio.to_thread(transcribe_audio, wav_path, selected_language)
+                    finally:
+                        import os
+                        if os.path.exists(wav_path):
+                            os.remove(wav_path)
+                    if result["text"]:
+                        transcript = merge_text(transcript, result["text"])
+                        await ws.send_json({
+                            "type": "transcription_partial",
+                            "transcript": transcript,
+                            "window_text": result["text"],
+                            "language": result["language"],
+                            "language_probability": result["language_probability"],
+                            "duration": elapsed,
+                        })
+                    last_processed_samples = total_samples
 
-                print(
-                    f"Received audio chunk: "
-                    f"{len(audio_chunk)} bytes | "
-                    f"Total: {len(audio_buffer)} bytes"
-                )
-
-                await websocket.send_json({
-                    "type": "audio_received",
-                    "chunk_size": len(audio_chunk),
-                    "total_bytes": len(audio_buffer)
-                })
-
-            # Handle JSON control messages.
             elif message.get("text") is not None:
                 try:
                     data = json.loads(message["text"])
                 except json.JSONDecodeError:
-                    await websocket.send_json({
-                        "type": "transcription_error",
-                        "message": "Invalid control message."
-                    })
+                    await ws.send_json({"type": "transcription_error", "message": "Invalid control message"})
                     continue
-
                 if data.get("type") == "config":
-                    selected_language = data.get(
-                        "language", "auto"
-                    )
-
-                    print(
-                        f"Selected language: {selected_language}"
-                    )
-
+                    selected_language = data.get("language", "auto")
+                    title = data.get("title") or title
                 elif data.get("type") == "stop":
-                    if not audio_buffer:
-                        await websocket.send_json({
-                            "type": "transcription_error",
-                            "message": "No audio was received."
-                        })
-                        await websocket.close()
+                    if not pcm_buffer:
+                        await ws.send_json({"type": "transcription_error", "message": "No audio received"})
+                        await ws.close()
                         return
-
-                    print("Audio recording completed.")
-                    print("Starting speech transcription...")
-
-                    await websocket.send_json({
-                        "type": "transcription_started",
-                        "message": "Transcription is processing."
-                    })
-
-                    temp_path = None
-
+                    wav_path = pcm_to_wav(bytes(pcm_buffer))
                     try:
-                        # Save the complete WebM recording.
-                        with tempfile.NamedTemporaryFile(
-                            suffix=".webm",
-                            delete=False
-                        ) as temp_file:
-                            temp_file.write(audio_buffer)
-                            temp_path = temp_file.name
-
-                        # Run CPU-heavy transcription outside
-                        # the FastAPI event loop.
-                        result = await asyncio.to_thread(
-                            transcribe_audio,
-                            temp_path,
-                            selected_language
-                        )
-
-                        await websocket.send_json({
-                            "type": "transcription_completed",
-                            "transcript": result["text"],
-                            "language": result["language"],
-                            "language_probability": (
-                                result["language_probability"]
-                            ),
-                            "duration": result["duration"]
-                        })
-
-                        print("Transcription completed.")
-                        print("Result:", result["text"])
-
-                    except Exception as exc:
-                        print("Transcription error:", str(exc))
-
-                        await websocket.send_json({
-                            "type": "transcription_error",
-                            "message": str(exc)
-                        })
-
+                        result = await asyncio.to_thread(transcribe_audio, wav_path, selected_language)
                     finally:
-                        if temp_path and os.path.exists(temp_path):
-                            os.remove(temp_path)
-
-                    await websocket.close()
+                        import os
+                        if os.path.exists(wav_path):
+                            os.remove(wav_path)
+                    final_text = result["text"] or transcript
+                    db: Session = SessionLocal()
+                    try:
+                        item = Transcription(
+                            title=title,
+                            text=final_text,
+                            language=result["language"],
+                            language_probability=result["language_probability"],
+                            duration=result["duration"],
+                        )
+                        db.add(item)
+                        db.commit()
+                        db.refresh(item)
+                        record_id = item.id
+                    finally:
+                        db.close()
+                    await ws.send_json({
+                        "type": "transcription_completed",
+                        "id": record_id,
+                        "transcript": final_text,
+                        "language": result["language"],
+                        "language_probability": result["language_probability"],
+                        "duration": result["duration"],
+                    })
+                    await ws.close()
                     return
-
     except WebSocketDisconnect:
         print("WebSocket client disconnected")
-
     except Exception as exc:
-        print("WebSocket error:", str(exc))
-
+        print("WebSocket transcription error:", repr(exc))
         try:
-            await websocket.send_json({
-                "type": "transcription_error",
-                "message": "An unexpected backend error occurred."
-            })
-            await websocket.close()
+            await ws.send_json({"type": "transcription_error", "message": "Transcription failed. Check backend logs and audio/model dependencies."})
+            await ws.close()
         except Exception:
             pass
